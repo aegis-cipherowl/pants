@@ -1,0 +1,206 @@
+# Copyright 2026 Pants project contributors (see CONTRIBUTORS.md).
+# Licensed under the Apache License, Version 2.0 (see LICENSE).
+#
+# Builds and publishes our private Pants PEX.
+#
+# NB: upstream's `release.yaml` cannot be reused for this. Every one of its jobs is gated on
+# `github.repository_owner == 'pantsbuild'` and it targets Depot runners we do not have. It also
+# builds manylinux wheels we do not need -- we only want the `pants-pex` artifact that scie-pants
+# fetches via PANTS_BOOTSTRAP_URLS.
+#
+# The version is read from `src/python/pants/VERSION` rather than taken as an input, so the tag and
+# the artifact can never disagree. Bump that file to publish a new build; see the release job for
+# why a version is never republished.
+
+name: CipherOwl Pants release
+
+on:
+  workflow_dispatch:
+    inputs:
+      draft:
+        description: "Create the release as a draft"
+        type: boolean
+        default: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  version:
+    name: Read version
+    if: github.repository_owner == 'aegis-cipherowl'
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+      tag: ${{ steps.read.outputs.tag }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Read version
+        id: read
+        run: |
+          VERSION=$(tr -d '[:space:]' < src/python/pants/VERSION)
+          if [[ "$VERSION" != *"+cipherowl."* ]]; then
+            echo "::error::src/python/pants/VERSION is '$VERSION', which carries no +cipherowl local"
+            echo "::error::version. Publishing it would collide with a real upstream release."
+            exit 1
+          fi
+          echo "version=$VERSION" | tee -a "$GITHUB_OUTPUT"
+          echo "tag=co_$VERSION"  | tee -a "$GITHUB_OUTPUT"
+
+      # scie-pants caches by version and will not re-fetch an artifact name it has already
+      # installed, so a machine that has seen this version would keep serving the old build
+      # forever. Deleting the venv by hand does not reset it. Fail loudly instead.
+      - name: Refuse to republish an existing version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${{ steps.read.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release ${{ steps.read.outputs.tag }} already exists."
+            echo "::error::Never republish a version with different content -- scie-pants caches by"
+            echo "::error::version. Bump src/python/pants/VERSION instead."
+            exit 1
+          fi
+
+  build:
+    name: Build PEX (${{ matrix.name }})
+    needs: version
+    if: github.repository_owner == 'aegis-cipherowl'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # glibc direction is what matters: 22.04 ships glibc 2.35 and our CI base image is
+          # python:3.12-slim-trixie (Debian 13, glibc 2.41), so this is forward-compatible.
+          # If we ever need to run on something older, switch to a manylinux_2_28 container as
+          # upstream does for its wheels.
+          - name: Linux-x86_64
+            runs-on: ubuntu-22.04
+          # macOS matters as much as Linux: once pants.toml names our version there is no stock
+          # fallback for developers on Macs.
+          - name: macOS-ARM64
+            runs-on: macos-14
+    runs-on: ${{ matrix.runs-on }}
+    env:
+      # Our fork has no remote cache; make sure nothing in pants.toml tries to reach one.
+      PANTS_REMOTE_CACHE_READ: "false"
+      PANTS_REMOTE_CACHE_WRITE: "false"
+    steps:
+      - name: Check out code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # The repo's `./pants` script requires a real CPython 3.14 on PATH -- `[python]
+      # interpreter_constraints` is `==3.14.*`, and `determine_python` rejects an inactive
+      # pyenv shim.
+      - name: Set up Python 3.14
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+
+      - name: Install Protoc # for the prost crate
+        uses: benjyw/setup-protoc@fa4f90fddf8838036cbdeadf1262b9755f6cfb85
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          version: 23.x
+
+      - name: Set rustup profile
+        run: rustup set profile default
+      - name: Cache Rust toolchain
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          key: ${{ matrix.name }}-rustup-${{ hashFiles('src/rust/rust-toolchain') }}-v2
+          path: |
+            ~/.rustup/toolchains/1.96.0-*
+            ~/.rustup/update-hashes
+            ~/.rustup/settings.toml
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          cache-bin: "false"
+          shared-key: engine
+          workspaces: src/rust
+
+      # NB: no `@parametrize` here. That exists on `main`; on 2.33.x `pants-pex` is a plain
+      # `pex_binary`, and `src/python/pants:pants-pex@parametrize=cp314` does not resolve.
+      - name: Build Pants PEX
+        run: ./pants package src/python/pants:pants-pex
+
+      # Recipe lifted from upstream's generate_github_workflows.py so the names match exactly what
+      # scie-pants derives from `pants_version`: pants.<version>-cp314-<platform>.pex
+      - name: Rename the Pants PEX to its final name
+        run: |
+          PANTS_VER=$(PEX_INTERPRETER=1 dist/src.python.pants/pants-pex.pex -c "import pants.version;print(pants.version.VERSION)")
+          PY_VER=$(PEX_INTERPRETER=1 dist/src.python.pants/pants-pex.pex -c "import sys;print(f'cp{sys.version_info[0]}{sys.version_info[1]}{sys.abiflags}')")
+          PLAT=$(PEX_INTERPRETER=1 dist/src.python.pants/pants-pex.pex -c "import os;print(f'{os.uname().sysname.lower()}_{os.uname().machine.lower()}')")
+
+          if [[ "$PANTS_VER" != "${{ needs.version.outputs.version }}" ]]; then
+            echo "::error::PEX reports $PANTS_VER but VERSION file says ${{ needs.version.outputs.version }}"
+            exit 1
+          fi
+
+          PEX_FILENAME=pants.$PANTS_VER-$PY_VER-$PLAT.pex
+          PEX_SCIE_FILENAME=pants.$PANTS_VER-$PY_VER-$PLAT
+
+          mv dist/src.python.pants/pants-pex.pex dist/src.python.pants/$PEX_FILENAME
+          mv dist/src.python.pants/pants-pex     dist/src.python.pants/$PEX_SCIE_FILENAME
+          echo "PEX_FILENAME=$PEX_FILENAME"           | tee -a "$GITHUB_ENV"
+          echo "PEX_SCIE_FILENAME=$PEX_SCIE_FILENAME" | tee -a "$GITHUB_ENV"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pex-${{ matrix.name }}
+          path: |
+            dist/src.python.pants/${{ env.PEX_FILENAME }}
+            dist/src.python.pants/${{ env.PEX_SCIE_FILENAME }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish release
+    needs: [version, build]
+    if: github.repository_owner == 'aegis-cipherowl'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ needs.version.outputs.tag }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Pants ${{ needs.version.outputs.version }}" \
+            ${{ inputs.draft && '--draft' || '' }} \
+            --notes "Private Pants build for the CipherOwl monorepo.
+
+          Built from \`src/python/pants/VERSION\` = \`${{ needs.version.outputs.version }}\`.
+
+          Consumed via \`PANTS_BOOTSTRAP_URLS\`; see \`src/docker/circleci/pants-bootstrap-urls.json\`
+          in the monorepo. Record the **asset URLs printed by this workflow**, not a constructed
+          name: GitHub rewrites characters such as \`+\` in asset filenames, while the JSON key must
+          stay the exact artifact name scie-pants derives from \`pants_version\`. The key and the URL
+          are independent." \
+            artifacts/*
+
+      - name: Print the ptex map for the monorepo
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Paste these URLs into src/docker/circleci/pants-bootstrap-urls.json:"
+          echo
+          gh release view "${{ needs.version.outputs.tag }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets \
+            --jq '.assets[] | select(.name | endswith(".pex")) | "  \(.name)\n    -> \(.url)"'
