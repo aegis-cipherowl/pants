@@ -14,6 +14,7 @@ from pants.backend.go.util_rules.build_opts import (
     GoBuildOptionsFromTargetRequest,
     go_extract_build_options_from_target,
 )
+from pants.backend.go.util_rules.go_bootstrap import GoBootstrap
 from pants.backend.go.util_rules.go_mod import (
     GoModInfoRequest,
     OwningGoModRequest,
@@ -24,12 +25,18 @@ from pants.backend.go.util_rules.goroot import GoRoot
 from pants.core.goals.lint import LintResult, LintTargetsRequest
 from pants.core.goals.resolves import ExportableTool
 from pants.core.util_rules.config_files import find_config_file
+from pants.core.util_rules.env_vars import environment_vars_subset
 from pants.core.util_rules.external_tool import download_external_tool
 from pants.core.util_rules.partitions import Partition, PartitionerType, Partitions
 from pants.core.util_rules.source_files import SourceFilesRequest, determine_source_files
-from pants.core.util_rules.system_binaries import BashBinary
+from pants.core.util_rules.system_binaries import (
+    BashBinary,
+    BinaryShimsRequest,
+    create_binary_shims,
+)
 from pants.engine.addresses import Address
-from pants.engine.fs import CreateDigest, FileContent, MergeDigests
+from pants.engine.env_vars import EnvironmentVarsRequest
+from pants.engine.fs import CreateDigest, Digest, FileContent, MergeDigests
 from pants.engine.internals.graph import transitive_targets as transitive_targets_get
 from pants.engine.internals.selectors import concurrently
 from pants.engine.intrinsics import create_digest, execute_process, merge_digests
@@ -103,6 +110,7 @@ async def run_golangci_lint(
     platform: Platform,
     golang_subsystem: GolangSubsystem,
     golang_env_aware: GolangSubsystem.EnvironmentAware,
+    go_bootstrap: GoBootstrap,
 ) -> LintResult:
     # Get the single go.mod address for this partition
     go_mod_address = request.partition_metadata.go_mod_address
@@ -126,6 +134,15 @@ async def run_golangci_lint(
     go_build_opts_request = go_extract_build_options_from_target(
         GoBuildOptionsFromTargetRequest(go_mod_address), **implicitly()
     )
+    # golangci-lint runs its own `go list`-style module loading, so it needs the same
+    # environment the Go SDK processes get in `setup_go_sdk_process`: the
+    # `[golang].subprocess_env_vars` (e.g. `HOME` for git credential/URL-rewrite config,
+    # `GOPRIVATE`, `GONOSUMDB`). Without these, any module that is only reachable through
+    # an authenticated VCS fetch fails to typecheck and the whole partition fails.
+    env_vars_request = environment_vars_subset(
+        EnvironmentVarsRequest(golang_env_aware.env_vars_to_pass_to_subprocesses),
+        **implicitly(),
+    )
 
     (
         target_source_files,
@@ -134,6 +151,7 @@ async def run_golangci_lint(
         config_files,
         go_mod_info,
         go_build_opts,
+        env_vars,
     ) = await concurrently(
         target_source_files_request,
         all_source_files_request,
@@ -141,6 +159,7 @@ async def run_golangci_lint(
         config_files_request,
         go_mod_info_request,
         go_build_opts_request,
+        env_vars_request,
     )
 
     cgo_enabled = go_build_opts.cgo_enabled
@@ -151,6 +170,26 @@ async def run_golangci_lint(
     tool_search_path = ":".join(
         ["${GOROOT}/bin", *(golang_env_aware.cgo_tool_search_paths if cgo_enabled else ())]
     )
+
+    env: dict[str, str] = dict(env_vars)
+    immutable_input_digests: dict[str, Digest] = {}
+    # `[golang].extra_tools` (e.g. `git`, which `go` shells out to for VCS-backed modules)
+    # are exposed through binary shims exactly as for the Go SDK processes.
+    if golang_env_aware.extra_tools:
+        extra_tools = await create_binary_shims(
+            BinaryShimsRequest.for_binaries(
+                *golang_env_aware.extra_tools,
+                rationale="allow additional tools for golangci-lint",
+                search_path=go_bootstrap.go_search_paths,
+            ),
+            bash,
+        )
+        env["PATH"] = (
+            f"{extra_tools.path_component}:{env['PATH']}"
+            if env.get("PATH")
+            else extra_tools.path_component
+        )
+        immutable_input_digests.update(extra_tools.immutable_input_digests)
 
     # Compute package directories relative to the go.mod directory
     package_dirs = sorted(
@@ -167,20 +206,38 @@ async def run_golangci_lint(
         depth = len(go_mod_dir.split(os.sep))
         sandbox_root_prefix = "../" * depth
 
-    # golangci-lint requires an absolute path to a cache
+    # The module cache, the Go build cache and golangci-lint's own analysis cache are
+    # append-only named caches shared across partitions and runs. A fresh sandbox
+    # GOPATH would make every partition re-download the module closure of the packages
+    # it lints (the Go SDK processes never pay this: they compile from digests). All
+    # three are designed for concurrent, content-addressed use, and golangci-lint runs
+    # with `--allow-parallel-runners`.
+    append_only_caches = {
+        "golangci_lint_gomodcache": ".cache/golangci_lint/gomodcache",
+        "golangci_lint_gocache": ".cache/golangci_lint/gocache",
+        "golangci_lint_cache": ".cache/golangci_lint/lintcache",
+    }
+    # Absolute paths (via `{chroot}` interpolation in env values): the process runs with
+    # `working_directory` set to the module directory, and `go` requires absolute cache paths.
+    env["GOMODCACHE"] = "{chroot}/.cache/golangci_lint/gomodcache"
+    env["GOCACHE"] = "{chroot}/.cache/golangci_lint/gocache"
+    env["GOLANGCI_LINT_CACHE"] = "{chroot}/.cache/golangci_lint/lintcache"
+
+    # golangci-lint requires an absolute path to a cache. The tool search path goes
+    # first so the pinned GOROOT's `go` wins; the environment's PATH (binary shims for
+    # `[golang].extra_tools`, then whatever `[golang].subprocess_env_vars` forwarded)
+    # follows so `go` can find e.g. `git`.
     golangci_lint_run_script = FileContent(
         "__run_golangci_lint.sh",
         textwrap.dedent(
             f"""\
             export GOROOT={goroot.path}
             sandbox_root="$(/bin/pwd)"
-            export PATH="{tool_search_path}"
+            export PATH="{tool_search_path}${{PATH:+:$PATH}}"
             export GOPATH="${{sandbox_root}}/gopath"
-            export GOCACHE="${{sandbox_root}}/gocache"
-            export GOLANGCI_LINT_CACHE="$GOCACHE"
             export CGO_ENABLED={1 if cgo_enabled else 0}
             export GOTOOLCHAIN=local
-            /bin/mkdir -p "$GOPATH" "$GOCACHE"
+            /bin/mkdir -p "$GOPATH" "$GOMODCACHE" "$GOCACHE" "$GOLANGCI_LINT_CACHE"
             exec "$@"
             """
         ).encode("utf-8"),
@@ -229,6 +286,9 @@ async def run_golangci_lint(
         Process(
             argv=argv,
             input_digest=input_digest,
+            immutable_input_digests=immutable_input_digests,
+            append_only_caches=append_only_caches,
+            env=env,
             description=f"Run `golangci-lint` on {request.partition_metadata.description}.",
             level=LogLevel.DEBUG,
             working_directory=go_mod_dir or None,
