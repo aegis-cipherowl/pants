@@ -24,11 +24,13 @@ from pants.backend.go.util_rules.goroot import GoRoot
 from pants.core.goals.lint import LintResult, LintTargetsRequest
 from pants.core.goals.resolves import ExportableTool
 from pants.core.util_rules.config_files import find_config_file
+from pants.core.util_rules.env_vars import environment_vars_subset
 from pants.core.util_rules.external_tool import download_external_tool
 from pants.core.util_rules.partitions import Partition, PartitionerType, Partitions
 from pants.core.util_rules.source_files import SourceFilesRequest, determine_source_files
 from pants.core.util_rules.system_binaries import BashBinary
 from pants.engine.addresses import Address
+from pants.engine.env_vars import EnvironmentVarsRequest
 from pants.engine.fs import CreateDigest, FileContent, MergeDigests
 from pants.engine.internals.graph import transitive_targets as transitive_targets_get
 from pants.engine.internals.selectors import concurrently
@@ -126,6 +128,10 @@ async def run_golangci_lint(
     go_build_opts_request = go_extract_build_options_from_target(
         GoBuildOptionsFromTargetRequest(go_mod_address), **implicitly()
     )
+    env_vars_request = environment_vars_subset(
+        EnvironmentVarsRequest(golang_env_aware.env_vars_to_pass_to_subprocesses),
+        **implicitly(),
+    )
 
     (
         target_source_files,
@@ -134,6 +140,7 @@ async def run_golangci_lint(
         config_files,
         go_mod_info,
         go_build_opts,
+        env_vars,
     ) = await concurrently(
         target_source_files_request,
         all_source_files_request,
@@ -141,6 +148,7 @@ async def run_golangci_lint(
         config_files_request,
         go_mod_info_request,
         go_build_opts_request,
+        env_vars_request,
     )
 
     cgo_enabled = go_build_opts.cgo_enabled
@@ -232,6 +240,7 @@ async def run_golangci_lint(
             description=f"Run `golangci-lint` on {request.partition_metadata.description}.",
             level=LogLevel.DEBUG,
             working_directory=go_mod_dir or None,
+            env=env_vars,
         ),
         **implicitly(),
     )

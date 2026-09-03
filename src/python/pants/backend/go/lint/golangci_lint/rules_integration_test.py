@@ -133,6 +133,44 @@ def test_passing(rule_runner: RuleRunner) -> None:
     assert lint_results[0].stderr == ""
 
 
+def test_forwards_golang_subprocess_env_vars(rule_runner: RuleRunner) -> None:
+    rule_runner.write_files(
+        {
+            "main.go": dedent(
+                """\
+                package main
+                func main() {
+                \tenvOnly()
+                }
+                """
+            ),
+            "env_only.go": dedent(
+                """\
+                //go:build envtag
+
+                package main
+                func envOnly() {}
+                """
+            ),
+            "go.mod": GO_MOD,
+            "BUILD": "go_mod(name='mod')\ngo_package(name='pkg')\n",
+        },
+    )
+    tgt = rule_runner.get_target(Address("", target_name="pkg"))
+
+    lint_results = run_golangci_lint(
+        rule_runner,
+        [tgt],
+        extra_args=[
+            "--golang-subprocess-env-vars=['PATH', 'GOFLAGS=-tags=envtag']",
+        ],
+    )
+
+    assert len(lint_results) == 1
+    assert lint_results[0].exit_code == 0
+    assert lint_results[0].stderr == ""
+
+
 @pytest.mark.platform_specific_behavior
 def test_passing_v1(rule_runner: RuleRunner) -> None:
     """Test backwards compatibility with golangci-lint v1."""
