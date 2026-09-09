@@ -372,10 +372,6 @@ async fn wrapper_script_supports_sandbox_root_replacements_in_environmenbt() {
     assert_eq!(content, "xyzzy\n");
 }
 
-// `get_digest` used to `.unwrap()` the `make_execute_request` result, so any failure inside it --
-// including the transient "Failed to store wrapper script for remote execution" seen when a
-// GOSUMDB fetch dies mid-run -- aborted the whole process instead of surfacing an error. Both of
-// its callers are on the cache-key path, so a network blip could take down an entire run.
 #[tokio::test]
 async fn get_digest_propagates_errors_instead_of_panicking() {
     let store_dir = TempDir::new().unwrap();
