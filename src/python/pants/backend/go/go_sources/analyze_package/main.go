@@ -253,8 +253,7 @@ func analyzePackage(directory string, buildContext *build.Context) (*Package, er
 
 	// Record a file's imports into the constraint-free sets. Test files are split out by filename
 	// rather than by package name, since a constraint-excluded file's package directive is exactly
-	// what we are declining to trust here. NB: declared before the loop because the loop shadows
-	// the `fileInfo` type with a variable of the same name.
+	// what we are declining to trust here.
 	harvestAllImports := func(name string, analysis *fileInfo) {
 		if analysis == nil {
 			return
@@ -302,12 +301,12 @@ func analyzePackage(directory string, buildContext *build.Context) (*Package, er
 		// TODO: `MatchFile` will actually parse the imports but does not return the AST. Consider vendoring
 		// the MatchFile logic to avoid double parsing.
 		binaryOnly := false
-		fileInfo, err := matchFile(buildContext, directory, name, allTags, &binaryOnly, fileSet)
+		matchedFile, err := matchFile(buildContext, directory, name, allTags, &binaryOnly, fileSet)
 		if err != nil {
 			pkg.InvalidGoFiles[name] = err.Error()
 			continue
 		}
-		if fileInfo == nil {
+		if matchedFile == nil {
 			if strings.HasPrefix(name, "_") || strings.HasPrefix(name, ".") {
 				// `go` ignores files prefixed with underscore or period. Since this is not due to
 				// build constraints, do not report it as an ignored file. Fall through.

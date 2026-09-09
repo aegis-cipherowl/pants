@@ -89,7 +89,9 @@ class ThirdPartyPkgAnalysis:
 
     # Note that we don't care about test-related metadata like `TestImports`, as we'll never run
     # tests directly on a third-party package.
+    # NB: filtered by the host's build constraints. See `all_imports` below.
     imports: tuple[str, ...]
+
     go_files: tuple[str, ...]
     cgo_files: tuple[str, ...]
     cgo_flags: CGoCompilerFlags
@@ -108,6 +110,13 @@ class ThirdPartyPkgAnalysis:
     embed_patterns: tuple[str, ...]
     test_embed_patterns: tuple[str, ...]
     xtest_embed_patterns: tuple[str, ...]
+
+    # `imports` without the host's build constraints applied. Import-scoped target generation must
+    # walk this set, or the closure it computes would depend on the machine running Pants: a
+    # first-party `//go:build windows` file contributes its direct import as a root, but that
+    # module's own Windows-only dependencies would not be followed. Defaulted because a failed
+    # analysis has no imports to report at all.
+    all_imports: tuple[str, ...] = ()
 
     embed_config: EmbedConfig | None = None
     test_embed_config: EmbedConfig | None = None
@@ -464,6 +473,7 @@ async def analyze_go_third_party_package(
         dir_path=request.package_path,
         module_import_path=request.module_import_path,
         imports=tuple(request.pkg_json.get("Imports", ())),
+        all_imports=tuple(request.pkg_json.get("AllImports", ())),
         go_files=tuple(request.pkg_json.get("GoFiles", ())),
         c_files=tuple(request.pkg_json.get("CFiles", ())),
         cxx_files=tuple(request.pkg_json.get("CXXFiles", ())),
@@ -675,20 +685,32 @@ async def download_and_analyze_module(
     return AnalyzedThirdPartyModule(FrozenOrderedSet(analyzed_packages))
 
 
-def _resolve_import_path_to_module(
-    import_path: str, module_names_longest_first: tuple[str, ...]
-) -> str | None:
-    """Find the module in the build list that would provide `import_path`.
+class ModuleImportPathResolver:
+    """Resolves an import path to the build-list module that provides it.
 
     Matches `cmd/go`: a module provides an import path when the module path is the import path or
-    a path-segment prefix of it. Where several modules qualify (e.g. `example.com/a` and
-    `example.com/a/b` both on the build list), the longest match wins, which is the one Go would
-    select. Passing the names pre-sorted keeps that unambiguous rather than order-dependent.
+    a path-segment prefix of it, and where several qualify (e.g. `example.com/a` and
+    `example.com/a/b` are both on the build list) the longest match wins. The longest-first
+    ordering is established in the constructor so `resolve` can rely on it rather than the caller
+    having to uphold it.
+
+    Modules are indexed under both their name and their `import_path`: a versioned `replace` that
+    changes the path (`replace example.com/orig => example.com/fork v1.1.0`) has a `name` of
+    `example.com/fork` while first-party code still imports `example.com/orig/...`.
     """
-    for name in module_names_longest_first:
-        if import_path == name or import_path.startswith(f"{name}/"):
-            return name
-    return None
+
+    def __init__(self, module_analysis: ModuleDescriptors) -> None:
+        self._modules_by_path: dict[str, ModuleDescriptor] = {}
+        for mod in module_analysis.modules:
+            self._modules_by_path.setdefault(mod.name, mod)
+            self._modules_by_path.setdefault(mod.import_path, mod)
+        self._paths_longest_first = tuple(sorted(self._modules_by_path, key=len, reverse=True))
+
+    def resolve(self, import_path: str) -> ModuleDescriptor | None:
+        for path in self._paths_longest_first:
+            if import_path == path or import_path.startswith(f"{path}/"):
+                return self._modules_by_path[path]
+        return None
 
 
 async def _analyze_imported_packages(
@@ -704,16 +726,14 @@ async def _analyze_imported_packages(
     with the build-list path, which downloads and analyzes every module `go list -m all` reports
     regardless of what the repo imports.
     """
+    resolver = ModuleImportPathResolver(module_analysis)
     modules_by_name = {mod.name: mod for mod in module_analysis.modules}
-    # Longest first so the most specific module wins; see `_resolve_import_path_to_module`.
-    module_names_longest_first = tuple(sorted(modules_by_name, key=len, reverse=True))
 
     roots, stdlib_packages = await concurrently(
         determine_first_party_import_roots(
             FirstPartyImportRootsRequest(
                 go_mod_address=request.go_mod_address,
                 go_mod_path=request.go_mod_path,
-                cgo_enabled=request.build_opts.cgo_enabled,
             ),
             **implicitly(),
         ),
@@ -790,7 +810,7 @@ async def _analyze_imported_packages(
     frontier = {ip for ip in roots.import_paths if is_third_party(ip)}
     # Whatever the codegen modules themselves import has to resolve too.
     for pkg in reachable.values():
-        frontier.update(ip for ip in pkg.imports if is_third_party(ip))
+        frontier.update(ip for ip in (pkg.all_imports or pkg.imports) if is_third_party(ip))
     seen_import_paths |= set(reachable)
 
     while frontier:
@@ -801,9 +821,9 @@ async def _analyze_imported_packages(
         # cost nothing here.
         pending_modules = {}
         for import_path in frontier:
-            owning_module = _resolve_import_path_to_module(import_path, module_names_longest_first)
-            if owning_module is not None and owning_module not in analyzed_module_names:
-                pending_modules[owning_module] = modules_by_name[owning_module]
+            owning_module = resolver.resolve(import_path)
+            if owning_module is not None and owning_module.name not in analyzed_module_names:
+                pending_modules[owning_module.name] = owning_module
 
         if pending_modules:
             newly_analyzed = await concurrently(
@@ -834,7 +854,9 @@ async def _analyze_imported_packages(
                 # build-list path would not have produced a target for it either.
                 continue
             reachable[import_path] = reached_pkg
-            for dep_import_path in reached_pkg.imports:
+            # NB: `all_imports`, not `imports` -- see the field's comment. Falls back to the
+            # filtered set for analyses produced before the field existed.
+            for dep_import_path in reached_pkg.all_imports or reached_pkg.imports:
                 if dep_import_path in seen_import_paths or not is_third_party(dep_import_path):
                     continue
                 next_frontier.add(dep_import_path)

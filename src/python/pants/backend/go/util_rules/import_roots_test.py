@@ -24,6 +24,7 @@ from pants.backend.go.util_rules import (
 from pants.backend.go.util_rules.import_roots import (
     FirstPartyImportRoots,
     FirstPartyImportRootsRequest,
+    _is_ignored_by_go_walk,
     _is_nested_module_path,
     _parse_tool_directives,
 )
@@ -132,7 +133,6 @@ def _roots(rule_runner: RuleRunner, *, go_mod_path: str = "go.mod") -> set[str]:
             FirstPartyImportRootsRequest(
                 go_mod_address=Address("", target_name="mod"),
                 go_mod_path=go_mod_path,
-                cgo_enabled=True,
             )
         ],
     )
@@ -250,3 +250,55 @@ def test_scan_includes_tool_directives(rule_runner: RuleRunner) -> None:
         }
     )
     assert "example.com/cmd/generator" in _roots(rule_runner)
+
+
+def test_directories_go_list_ignores_are_skipped() -> None:
+    """`go list ./...` skips `testdata`, `vendor`, and `.`/`_` prefixed components."""
+    assert not _is_ignored_by_go_walk("src/go/pkg/util", "src/go")
+    assert _is_ignored_by_go_walk("src/go/pkg/testdata", "src/go")
+    assert _is_ignored_by_go_walk("src/go/testdata/deep/pkg", "src/go")
+    assert _is_ignored_by_go_walk("src/go/vendor/github.com/x/y", "src/go")
+    assert _is_ignored_by_go_walk("src/go/_scratch", "src/go")
+    assert _is_ignored_by_go_walk("src/go/.hidden/pkg", "src/go")
+    # Only whole components count -- these merely share a prefix.
+    assert not _is_ignored_by_go_walk("src/go/testdata_helpers", "src/go")
+    assert not _is_ignored_by_go_walk("src/go/vendoring", "src/go")
+    # The module root itself is never ignored, even under a `_`-prefixed path.
+    assert not _is_ignored_by_go_walk("_vendored/mod", "_vendored/mod")
+
+
+def test_scan_skips_testdata_and_vendor(rule_runner: RuleRunner) -> None:
+    """Imports that `go list ./...` never sees must not become roots."""
+    rule_runner.write_files(
+        {
+            "BUILD": "go_mod(name='mod')\n",
+            "go.mod": "module example.com/m\ngo 1.16\n",
+            "main.go": dedent(
+                """\
+                package main
+
+                import "github.com/real/dep"
+
+                func main() { dep.Do() }
+                """
+            ),
+            "testdata/fixture.go": dedent(
+                """\
+                package fixture
+
+                import "github.com/testdata/only"
+                """
+            ),
+            "vendor/github.com/x/y/y.go": dedent(
+                """\
+                package y
+
+                import "github.com/vendored/only"
+                """
+            ),
+        }
+    )
+    roots = _roots(rule_runner)
+    assert "github.com/real/dep" in roots
+    assert "github.com/testdata/only" not in roots
+    assert "github.com/vendored/only" not in roots

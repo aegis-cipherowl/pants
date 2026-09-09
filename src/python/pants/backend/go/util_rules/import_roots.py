@@ -20,7 +20,7 @@ import logging
 import os.path
 from dataclasses import dataclass
 
-import ijson
+import ijson.backends.python as ijson
 
 from pants.backend.go.util_rules.pkg_analyzer import PackageAnalyzerSetup
 from pants.build_graph.address import Address
@@ -48,7 +48,6 @@ class FirstPartyImportRootsRequest(EngineAwareParameter):
 
     go_mod_address: Address
     go_mod_path: str
-    cgo_enabled: bool
 
     def debug_hint(self) -> str:
         return self.go_mod_address.spec
@@ -92,6 +91,22 @@ async def determine_codegen_import_roots(
     req: GoCodegenImportRootsRequest, env_name: EnvironmentName
 ) -> GoCodegenImportRoots:
     raise NotImplementedError()
+
+
+def _is_ignored_by_go_walk(path: str, base_dir: str) -> bool:
+    """Whether `go list ./...` would skip this directory.
+
+    `cmd/go` ignores `testdata` and `vendor` directories, and any path component beginning with
+    `.` or `_`. Without this a `testdata` fixture importing a module on the build list would make
+    it a root, downloading the module and generating targets for code nothing builds.
+    """
+    relative = path[len(base_dir) :].lstrip("/") if base_dir else path
+    if not relative:
+        return False
+    return any(
+        component in ("testdata", "vendor") or component.startswith((".", "_"))
+        for component in relative.split("/")
+    )
 
 
 def _is_nested_module_path(path: str, base_dir: str, nested_module_dirs: frozenset[str]) -> bool:
@@ -163,6 +178,7 @@ async def determine_first_party_import_roots(
             os.path.dirname(f)
             for f in sources_snapshot.files
             if not _is_nested_module_path(os.path.dirname(f), base_dir, nested_module_dirs)
+            and not _is_ignored_by_go_walk(os.path.dirname(f), base_dir)
         }
     )
 
@@ -183,7 +199,10 @@ async def determine_first_party_import_roots(
                     f"({request.go_mod_address})"
                 ),
                 level=LogLevel.DEBUG,
-                env={"CGO_ENABLED": "1" if request.cgo_enabled else "0"},
+                # NB: pinned rather than taken from the caller's build options. `AllImports` is
+                # harvested from every file regardless of cgo, so both settings yield the same
+                # roots and threading it through would only split this scan's memo key.
+                env={"CGO_ENABLED": "1"},
             ),
             **implicitly(),
         )
