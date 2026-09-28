@@ -124,7 +124,9 @@ jobs:
       # NB: no `@parametrize` here. That exists on `main`; on 2.33.x `pants-pex` is a plain
       # `pex_binary`, and `src/python/pants:pants-pex@parametrize=cp314` does not resolve.
       - name: Build Pants PEX
-        run: ./pants package src/python/pants:pants-pex
+        # Explorer is a separate plugin, not an input to pants-pex. Avoid loading its
+        # unlocked bootstrap GraphQL dependencies while building the core distribution.
+        run: ./pants --backend-packages="-['pants_explorer.server']" package src/python/pants:pants-pex
 
       # Recipe lifted from upstream's generate_github_workflows.py so the names match exactly what
       # scie-pants derives from `pants_version`: pants.<version>-cp314-<platform>.pex
