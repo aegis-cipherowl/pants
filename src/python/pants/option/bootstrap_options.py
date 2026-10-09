@@ -820,6 +820,10 @@ class BootstrapOptions:
         ),
     )
     plugins = StrListOption(
+        # `pantsd` loads these onto its own `sys.path`, and `PluginResolver.resolve` constrains
+        # each resolve to what that `sys.path` already holds, so a changed value needs a new
+        # process rather than just a new scheduler (#23649).
+        daemon=True,
         advanced=True,
         help=softwrap(
             """
@@ -1096,7 +1100,7 @@ class BootstrapOptions:
         ),
     )
     sandboxer = BoolOption(
-        default=False,
+        default=True,
         daemon=False,
         help=softwrap(
             """
@@ -1105,9 +1109,6 @@ class BootstrapOptions:
             without pantsd). This works around a well-known race condition when a multithreaded
             program writes executable files and then spawns subprocesses to execute them, which
             can lead to ETXTBSY errors.
-
-            This is a new feature so it is off by default. In the future, once this is stable,
-            it will likely default to True.
             """
         ),
     )

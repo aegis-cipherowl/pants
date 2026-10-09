@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 from textwrap import dedent
@@ -21,7 +22,8 @@ from pants.option.bootstrap_options import (
 from pants.option.errors import OptionsError
 from pants.option.global_options import GlobalOptions
 from pants.option.options_bootstrapper import OptionsBootstrapper
-from pants.testutil.option_util import create_dynamic_remote_options
+from pants.option.scope import GLOBAL_SCOPE
+from pants.testutil.option_util import create_dynamic_remote_options, create_options_bootstrapper
 from pants.testutil.pytest_util import no_exception
 from pants.util.dirutil import safe_mkdir_for
 from pants.version import VERSION
@@ -147,6 +149,23 @@ def test_invalidation_globs() -> None:
     )
     for glob in globs:
         assert suffix not in glob
+
+
+def test_plugins_is_daemon_fingerprinted() -> None:
+    # A surviving `pantsd` constrains later plugin resolves to the versions already on its
+    # `sys.path`, so this option must invalidate the process itself (#23649).
+    ob = OptionsBootstrapper.create(
+        args=["--pants-config-files=[]", "--plugins=ansicolors==1.1.8"],
+        env={},
+        allow_pantsrc=False,
+    )
+    daemon_fingerprinted = {
+        name
+        for name, _, _ in ob.bootstrap_options.get_fingerprintable_for_scope(
+            GLOBAL_SCOPE, daemon_only=True
+        )
+    }
+    assert "plugins" in daemon_fingerprinted
 
 
 @pytest.mark.parametrize(
@@ -309,3 +328,34 @@ def test_free_threaded_advisory(
     else:
         assert advisory is not None
         assert expected in advisory
+
+
+def test_create_py_executor_respects_small_thread_counts() -> None:
+    ob = create_options_bootstrapper(
+        args=["--rule-threads-core=2", "--rule-threads-max=8"],
+    )
+    bootstrap_options = ob.bootstrap_options.for_global_scope()
+    executor = GlobalOptions.create_py_executor(bootstrap_options)
+    try:
+        assert executor.max_blocking_threads() == 6
+    finally:
+        executor.shutdown(5.0)
+
+
+def test_create_py_executor_clamps_and_warns_for_large_thread_counts(caplog) -> None:
+    # rule_threads_core=64 means rule_threads_max defaults to 256, so the requested blocking pool
+    # (max - core = 192) is past the 120 cap (#23652).
+    ob = create_options_bootstrapper(
+        args=["--rule-threads-core=64"],
+    )
+    bootstrap_options = ob.bootstrap_options.for_global_scope()
+    executor = GlobalOptions.create_py_executor(bootstrap_options)
+    try:
+        assert executor.max_blocking_threads() == 120
+        # Pants renames the WARNING level to WARN process-wide, so check levelno, not levelname.
+        assert any(
+            record.levelno == logging.WARNING and "capped this run to 120" in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        executor.shutdown(5.0)
