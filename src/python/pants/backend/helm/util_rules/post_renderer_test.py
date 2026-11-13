@@ -300,6 +300,7 @@ def test_use_simple_extra_post_renderer(rule_runner: RuleRunner) -> None:
               run_shell_command(
                 name="custom_post_renderer",
                 command="src/shell/my-script.sh",
+                workdir="/",
                 execution_dependencies=[":scripts"]
               )
               """
@@ -367,3 +368,100 @@ def test_use_simple_extra_post_renderer(rule_runner: RuleRunner) -> None:
         filename="mychart/templates/configmap.yaml",
     )
     assert rendered_configmap_file == _TEST_EXPECTED_CONFIGMAP_FILE
+
+
+def test_deployment_post_renderers_are_chained_after_builtin(rule_runner: RuleRunner) -> None:
+    rule_runner.write_files(
+        {
+            "src/mychart/BUILD": "helm_chart()",
+            "src/mychart/Chart.yaml": HELM_CHART_FILE,
+            "src/mychart/values.yaml": "image: ''",
+            "src/mychart/templates/_helpers.tpl": HELM_TEMPLATE_HELPERS_FILE,
+            "src/mychart/templates/pod.yaml": dedent(
+                """\
+                apiVersion: v1
+                kind: Pod
+                metadata:
+                  name: mypod
+                spec:
+                  containers:
+                    - name: app
+                      image: {{ .Values.image }}
+                """
+            ),
+            "src/image/BUILD": 'docker_image(name="app", source="Dockerfile")',
+            "src/image/Dockerfile": "FROM busybox:1.28",
+            "src/shell/BUILD": dedent(
+                """\
+                shell_sources(name="scripts")
+
+                run_shell_command(
+                  name="retag",
+                  command="src/shell/retag.sh",
+                  workdir="/",
+                  execution_dependencies=[":scripts"]
+                )
+                """
+            ),
+            "src/deployment/BUILD": dedent(
+                """\
+                helm_deployment(
+                  name="test",
+                  chart="//src/mychart",
+                  post_renderers=["//src/shell:retag"]
+                )
+                """
+            ),
+            "src/deployment/values.yaml": "image: src/image:app",
+        }
+    )
+
+    # The script only matches the ref written by the built-in renderer, so the rewrite proves
+    # both renderers ran, in that order.
+    rule_runner.write_digest(
+        rule_runner.request(
+            Digest,
+            [
+                CreateDigest(
+                    [
+                        FileContent(
+                            path="src/shell/retag.sh",
+                            content=dedent(
+                                """\
+                                #!/bin/bash
+                                sed 's|image: app:latest|image: app:chained|'
+                                """
+                            ).encode(),
+                            is_executable=True,
+                        )
+                    ]
+                )
+            ],
+        )
+    )
+
+    tgt = rule_runner.get_target(Address("src/deployment", target_name="test"))
+    field_set = HelmDeploymentFieldSet.create(tgt)
+
+    post_renderer = rule_runner.request(
+        HelmPostRenderer,
+        [HelmDeploymentPostRendererRequest(field_set)],
+    )
+
+    rendered_output = rule_runner.request(
+        RenderedHelmFiles,
+        [
+            HelmDeploymentRequest(
+                field_set=field_set,
+                cmd=HelmDeploymentCmd.RENDER,
+                description="Test chained post-renderers",
+                post_renderer=post_renderer,
+            )
+        ],
+    )
+
+    rendered_pod_file = _read_file_from_digest(
+        rule_runner, digest=rendered_output.snapshot.digest, filename="mychart/templates/pod.yaml"
+    )
+    assert "image: app:chained" in rendered_pod_file
+    assert "src/image:app" not in rendered_pod_file
