@@ -871,6 +871,7 @@ async def build_go_package(
                 import_path=request.import_path,
                 dir_path=request.dir_path,
                 extra_assembler_flags=extra_assembler_flags,
+                is_stdlib=request.is_stdlib,
             ),
             **implicitly(),
         )
@@ -1058,6 +1059,7 @@ async def build_go_package(
                 dir_path=request.dir_path,
                 import_path=request.import_path,
                 extra_assembler_flags=extra_assembler_flags,
+                is_stdlib=request.is_stdlib,
             ),
             **implicitly(),
         )
