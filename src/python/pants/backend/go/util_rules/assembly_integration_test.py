@@ -140,6 +140,7 @@ def test_build_package_with_assembly(rule_runner: RuleRunner) -> None:
     assert result.stdout == b"3\n"
 
 
+@pytest.mark.no_error_if_skipped
 def test_build_binary_with_stdlib_assembly_built_from_source(rule_runner: RuleRunner) -> None:
     # Go 1.27+ only lets objects assembled with `-std` reference `//go:linknamestd` symbols, which
     # `sync/atomic`'s assembly does. `compiler_flags` makes Pants build the stdlib from source
