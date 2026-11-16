@@ -80,7 +80,7 @@ jobs:
           # macOS matters as much as Linux: once pants.toml names our version there is no stock
           # fallback for developers on Macs.
           - name: macOS-ARM64
-            runs-on: macos-14
+            runs-on: macos-15
     runs-on: ${{ matrix.runs-on }}
     env:
       # Our fork has no remote cache; make sure nothing in pants.toml tries to reach one.
