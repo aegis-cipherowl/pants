@@ -98,6 +98,23 @@ async def setup_post_renderer_tool(
 HELM_POST_RENDERER_CFG_FILENAME = "post_renderer.cfg.yaml"
 _HELM_POST_RENDERER_WRAPPER_SCRIPT = "post_renderer_wrapper.sh"
 
+# A `RunRequest` may refer to its sandbox as `{chroot}` in args and env. The `run` goal
+# substitutes it, but Helm runs the wrapper script directly from the sandbox, so the wrapper
+# expands it from its own working directory instead.
+_CHROOT_PLACEHOLDER = "{chroot}"
+_CHROOT_SHELL_VAR = "__PANTS_HELM_POST_RENDERER_CHROOT"
+
+
+def _shell_word(value: str) -> str:
+    """Quote `value` for bash, expanding `{chroot}` to the wrapper's working directory."""
+    return f'"${_CHROOT_SHELL_VAR}"'.join(
+        shlex.quote(part) for part in value.split(_CHROOT_PLACEHOLDER)
+    )
+
+
+def _shell_cmd(args: Iterable[str]) -> str:
+    return " ".join(_shell_word(arg) for arg in args)
+
 
 @dataclass(frozen=True)
 class SetupHelmPostRenderer(EngineAwareParameter):
@@ -210,9 +227,6 @@ async def setup_post_renderer_launcher(
         **implicitly(),
     )
 
-    def shell_cmd(args: Iterable[str]) -> str:
-        return shlex.join(args)
-
     # Build a shell wrapper script which will be the actual entry-point sent to Helm as the post-renderer.
     # Extra post-renderers are plugged by piping the output of one into the next one in the order they
     # have been defined.
@@ -223,23 +237,36 @@ async def setup_post_renderer_launcher(
     )
     post_renderer_process_cli = " | ".join(
         [
-            shell_cmd(post_renderer_process.argv),
-            *[shell_cmd(post_renderer.args) for post_renderer in extra_post_renderers],
+            _shell_cmd(post_renderer_process.argv),
+            *[_shell_cmd(post_renderer.args) for post_renderer in extra_post_renderers],
         ]
     )
     logger.debug(
         f'Using post-renderer pipeline "{post_renderer_process_cli}" in {request.description_of_origin}.'
     )
 
-    postrenderer_wrapper_script = dedent(
-        f"""\
-        #!/bin/bash
+    # Env values that refer to `{chroot}` are exported by the wrapper, once it knows the path.
+    extra_env = {
+        k: v for post_renderer in extra_post_renderers for k, v in post_renderer.extra_env.items()
+    }
+    chroot_env_exports = "".join(
+        f"export {k}={_shell_word(v)}\n"
+        for k, v in sorted(extra_env.items())
+        if _CHROOT_PLACEHOLDER in v
+    )
 
-        # Output stdin into a file in disk
-        {cat_binary.path} <&0 > {post_renderer_input_file}
+    postrenderer_wrapper_script = (
+        f'#!/bin/bash\n\n{_CHROOT_SHELL_VAR}="$(pwd)"\n'
+        + chroot_env_exports
+        + dedent(
+            f"""\
 
-        {post_renderer_process_cli}
-        """
+            # Output stdin into a file in disk
+            {cat_binary.path} <&0 > {post_renderer_input_file}
+
+            {post_renderer_process_cli}
+            """
+        )
     )
     wrapper_digest = await create_digest(
         CreateDigest(
@@ -265,11 +292,7 @@ async def setup_post_renderer_launcher(
     )
     launcher_env = {
         **post_renderer_process.env,
-        **{
-            k: v
-            for post_renderer in extra_post_renderers
-            for k, v in post_renderer.extra_env.items()
-        },
+        **{k: v for k, v in extra_env.items() if _CHROOT_PLACEHOLDER not in v},
     }
     launcher_append_only_caches = {
         **post_renderer_process.append_only_caches,
