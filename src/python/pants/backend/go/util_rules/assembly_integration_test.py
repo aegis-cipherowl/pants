@@ -28,6 +28,7 @@ from pants.backend.go.util_rules import (
 )
 from pants.backend.go.util_rules.build_opts import GoBuildOptions
 from pants.backend.go.util_rules.build_pkg import BuildGoPackageRequest, FallibleBuiltGoPackage
+from pants.backend.go.util_rules.goroot import GoRoot
 from pants.core.goals.package import BuiltPackage
 from pants.engine.addresses import Address
 from pants.engine.rules import QueryRule
@@ -53,6 +54,7 @@ def rule_runner() -> RuleRunner:
             *sdk.rules(),
             QueryRule(BuiltPackage, (GoBinaryFieldSet,)),
             QueryRule(FallibleBuiltGoPackage, (BuildGoPackageRequest,)),
+            QueryRule(GoRoot, ()),
         ],
         target_types=[
             GoBinaryTarget,
@@ -136,6 +138,55 @@ def test_build_package_with_assembly(rule_runner: RuleRunner) -> None:
     result = subprocess.run([os.path.join(rule_runner.build_root, "bin")], stdout=subprocess.PIPE)
     assert result.returncode == 0
     assert result.stdout == b"3\n"
+
+
+@pytest.mark.no_error_if_skipped
+def test_build_binary_with_stdlib_assembly_built_from_source(rule_runner: RuleRunner) -> None:
+    # Go 1.27+ only lets objects assembled with `-std` reference `//go:linknamestd` symbols, which
+    # `sync/atomic`'s assembly does. `compiler_flags` makes Pants build the stdlib from source
+    # instead of using prebuilt archives. The referenced symbols are Go code on linux/amd64; on
+    # platforms where they are assembly (e.g. darwin/arm64) the link succeeds even without `-std`.
+    goroot = rule_runner.request(GoRoot, [])
+    if not goroot.is_compatible_version("1.27"):
+        pytest.skip("Requires Go 1.27+")
+    if (goroot.goos, goroot.goarch) != ("linux", "amd64"):
+        pytest.skip("Requires linux/amd64")
+
+    rule_runner.write_files(
+        {
+            "go.mod": "module example.com/stdlib_assembly\ngo 1.27\n",
+            "main.go": dedent(
+                """\
+                package main
+
+                import (
+                    "fmt"
+                    "sync/atomic"
+                )
+
+                func main() {
+                    var n int64
+                    atomic.AddInt64(&n, 2)
+                    fmt.Println(atomic.LoadInt64(&n))
+                }
+                """
+            ),
+            "BUILD": dedent(
+                """\
+                go_mod(name="mod", compiler_flags=["-lang=go1.27"])
+                go_package(name="pkg")
+                go_binary(name="bin", cgo_enabled=False)
+                """
+            ),
+        }
+    )
+
+    binary_tgt = rule_runner.get_target(Address("", target_name="bin"))
+    build_package(rule_runner, binary_tgt)
+
+    result = subprocess.run([os.path.join(rule_runner.build_root, "bin")], stdout=subprocess.PIPE)
+    assert result.returncode == 0
+    assert result.stdout == b"2\n"
 
 
 def test_build_invalid_package(rule_runner: RuleRunner) -> None:

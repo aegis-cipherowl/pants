@@ -28,6 +28,7 @@ class GenerateAssemblySymabisRequest:
     import_path: str
     dir_path: str
     extra_assembler_flags: tuple[str, ...]
+    is_stdlib: bool = False
 
 
 @dataclass(frozen=True)
@@ -53,6 +54,7 @@ class AssembleGoAssemblyFilesRequest:
     dir_path: str
     import_path: str
     extra_assembler_flags: tuple[str, ...]
+    is_stdlib: bool = False
 
 
 @dataclass(frozen=True)
@@ -70,10 +72,14 @@ class FallibleAssembleGoAssemblyFilesResult:
 
 # Adapted from https://github.com/golang/go/blob/cb07765045aed5104a3df31507564ac99e6ddce8/src/cmd/go/internal/work/gc.go#L358-L410
 #
-# Note: Architecture-specific flags have not been adapted nor the flags added when compiling Go SDK packages
-# themselves.
+# Note: Architecture-specific flags have not been adapted. Of the flags added when compiling Go SDK
+# packages themselves, only `-std` and `-compiling-runtime` are.
 def _asm_args(
-    import_path: str, dir_path: str, goroot: GoRoot, extra_flags: Iterable[str]
+    import_path: str,
+    dir_path: str,
+    goroot: GoRoot,
+    extra_flags: Iterable[str],
+    is_stdlib: bool = False,
 ) -> tuple[str, ...]:
     # On Go 1.19+, the import path must be supplied via the `-p` option to `go tool asm`.
     # See https://go.dev/doc/go1.19#assembler and
@@ -100,6 +106,14 @@ def _asm_args(
         else []
     )
 
+    # Go 1.27+ marks standard library objects assembled with `-std`, mirroring the compiler's `-std`.
+    # Symbols pushed with `//go:linknamestd` (e.g. `internal/runtime/atomic.Load`, which
+    # `sync/atomic`'s assembly jumps to) may only be referenced from such objects; without the flag
+    # the linker fails with "sync/atomic: invalid reference to internal/runtime/atomic.Load".
+    # Older assemblers reject the flag.
+    # See https://github.com/golang/go/blob/go1.27.0/src/cmd/go/internal/work/gc.go (`asmArgs`).
+    maybe_std_args = ["-std"] if is_stdlib and goroot.is_compatible_version("1.27") else []
+
     return (
         *maybe_package_import_path_args,
         "-trimpath",
@@ -113,6 +127,7 @@ def _asm_args(
         f"GOOS_{goroot.goos}",
         "-D",
         f"GOARCH_{goroot.goarch}",
+        *maybe_std_args,
         *maybe_assembling_stdlib_runtime_args,
         *extra_flags,
     )
@@ -152,6 +167,7 @@ async def generate_go_assembly_symabisfile(
                         dir_path=request.dir_path,
                         goroot=goroot,
                         extra_flags=request.extra_assembler_flags,
+                        is_stdlib=request.is_stdlib,
                     ),
                     "-gensymabis",
                     "-o",
@@ -207,6 +223,7 @@ async def assemble_go_assembly_files(
                             dir_path=request.dir_path,
                             goroot=goroot,
                             extra_flags=request.extra_assembler_flags,
+                            is_stdlib=request.is_stdlib,
                         ),
                         "-o",
                         obj_output_path(s_file),
