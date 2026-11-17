@@ -465,3 +465,78 @@ def test_deployment_post_renderers_are_chained_after_builtin(rule_runner: RuleRu
     )
     assert "image: app:chained" in rendered_pod_file
     assert "src/image:app" not in rendered_pod_file
+
+
+def test_deployment_post_renderer_sees_its_chroot(rule_runner: RuleRunner) -> None:
+    # `run_shell_command` hands its renderer `CHROOT={chroot}`, as `pex_binary` hands it
+    # `{chroot}/<pex>` in args; both must resolve to the sandbox Helm runs the wrapper in.
+    rule_runner.write_files(
+        {
+            "src/mychart/BUILD": "helm_chart()",
+            "src/mychart/Chart.yaml": HELM_CHART_FILE,
+            "src/mychart/templates/_helpers.tpl": HELM_TEMPLATE_HELPERS_FILE,
+            "src/mychart/templates/configmap.yaml": _TEST_GIVEN_CONFIGMAP_FILE,
+            "src/shell/BUILD": dedent(
+                """\
+                shell_sources(name="scripts")
+
+                run_shell_command(
+                  name="chroot_check",
+                  command="src/shell/chroot-check.sh",
+                  workdir="/",
+                  execution_dependencies=[":scripts"]
+                )
+                """
+            ),
+            "src/deployment/BUILD": dedent(
+                """\
+                helm_deployment(
+                  name="test",
+                  chart="//src/mychart",
+                  post_renderers=["//src/shell:chroot_check"]
+                )
+                """
+            ),
+        }
+    )
+    rule_runner.write_digest(
+        rule_runner.request(
+            Digest,
+            [
+                CreateDigest(
+                    [
+                        FileContent(
+                            path="src/shell/chroot-check.sh",
+                            content=dedent(
+                                """\
+                                #!/bin/bash
+                                [ -x "$CHROOT/src/shell/chroot-check.sh" ] || exit 3
+                                cat <&0
+                                """
+                            ).encode(),
+                            is_executable=True,
+                        )
+                    ]
+                )
+            ],
+        )
+    )
+
+    tgt = rule_runner.get_target(Address("src/deployment", target_name="test"))
+    field_set = HelmDeploymentFieldSet.create(tgt)
+    post_renderer = rule_runner.request(
+        HelmPostRenderer,
+        [HelmDeploymentPostRendererRequest(field_set)],
+    )
+    rendered_output = rule_runner.request(
+        RenderedHelmFiles,
+        [
+            HelmDeploymentRequest(
+                field_set=field_set,
+                cmd=HelmDeploymentCmd.RENDER,
+                description="Test post-renderer chroot",
+                post_renderer=post_renderer,
+            )
+        ],
+    )
+    assert "mychart/templates/configmap.yaml" in rendered_output.snapshot.files

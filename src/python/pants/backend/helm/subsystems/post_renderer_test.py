@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import PurePath
 from textwrap import dedent
 
@@ -76,3 +77,26 @@ def test_post_renderer_is_runnable(rule_runner: RuleRunner) -> None:
                 "./helm_post_renderer.pex_pex_shim.sh ./post_renderer.cfg.yaml ./__helm_stdout.yaml"
                 in script_lines
             )
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("plain", "plain"),
+        ("has space", "has space"),
+        ("{chroot}/bin/tool.pex", "/sandbox dir/bin/tool.pex"),
+        ("a:{chroot}/x:{chroot}/y", "a:/sandbox dir/x:/sandbox dir/y"),
+        ("it's $HOME `x`", "it's $HOME `x`"),
+    ],
+)
+def test_shell_word_expands_chroot_and_quotes_the_rest(value: str, expected: str) -> None:
+    # Helm runs the wrapper directly, so `{chroot}` must become the wrapper's own working
+    # directory rather than reach the command literally (as it did for `pex_binary` renderers).
+    word = post_renderer._shell_word(value)
+    result = subprocess.run(
+        ["bash", "-c", f'{post_renderer._CHROOT_SHELL_VAR}="/sandbox dir"; printf %s {word}'],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout == expected
